@@ -15,3 +15,6 @@ report.tsv
 中医学基础.docx
 中医学基础.pdf
 *.local.*
+*-带书签.pdf
+*_bookmarked.pdf
+中医学基础*.pdf

@@ -178,12 +178,13 @@ def build_lines(doc, margin_ignore: float):
 
 
 def flag_toc_pages(lines, page_count: int, headings=(), manual=None) -> set[int]:
-    """识别文档自带的目录页，匹配时整页跳过。
+    """识别文档自带的目录页。
 
     两路信号：
       A. 点线/制表符 + 页码结尾的行 ≥ 2 条
-      B. 兜底：某一页同时“命中”≥3 个不同标题（目录条目常不带点线）
-         为免误伤正文里紧挨着的多个小标题，只在文档前 40% 生效。
+      B. 兜底：该页“命中”≥3 个不同标题，且**整页几乎全是标题行**
+         （目录页正文极少；正文页即使有 3 个小标题，也夹杂大量正文，占比很低）
+         为免误伤，只在文档前 40% 生效。
     """
     if manual:
         return set(manual)
@@ -195,23 +196,69 @@ def flag_toc_pages(lines, page_count: int, headings=(), manual=None) -> set[int]
     toc = {p for p, c in hits.items() if c >= 2}
 
     normed = [n for n in (norm(t) for _l, t, _i in headings) if n]
-    if normed:
-        per: dict[int, set[str]] = {}
-        for ln in lines:
-            nl = ln.n
-            for n in normed:
-                if n in nl and len(nl) - len(n) <= 20:
-                    per.setdefault(ln.page, set()).add(n)
-        front = max(2, int(page_count * 0.4))
-        for p, ks in per.items():
-            if len(ks) >= 3 and p <= front:
-                toc.add(p)
+    if not normed:
+        return toc
+
+    per_page: dict[int, set[str]] = {}
+    total_chars: dict[int, int] = {}
+    head_chars: dict[int, int] = {}
+    for ln in lines:
+        nl = ln.n
+        total_chars[ln.page] = total_chars.get(ln.page, 0) + len(nl)
+        for n in normed:
+            if n in nl and len(nl) - len(n) <= 20:
+                per_page.setdefault(ln.page, set()).add(n)
+                head_chars[ln.page] = head_chars.get(ln.page, 0) + len(nl)
+                break
+
+    front = max(2, int(page_count * 0.4))
+    for p, ks in per_page.items():
+        if len(ks) < 3 or p > front:
+            continue
+        ratio = head_chars.get(p, 0) / max(1, total_chars.get(p, 1))
+        if ratio >= 0.55:           # 整页基本都是标题行 → 目录
+            toc.add(p)
     return toc
 
 
 # ---------------------------------------------------------------- 匹配
 
 LOOKAHEAD_PAGES = 1     # 找到首个候选后，再多看几页，取分数更高的那个
+
+
+def _scan(lines, nt, start, allow_toc, toc_pages, median_size):
+    """从 start 起按阅读顺序收集候选，返回按分数降序的列表。"""
+    first_page = None
+    cands = []
+    for i in range(start, len(lines)):
+        ln = lines[i]
+        if not allow_toc and ln.page in toc_pages:
+            continue
+        if first_page is not None and ln.page > first_page + LOOKAHEAD_PAGES:
+            break
+        for nl, joined in ((ln.n, False), (ln.n_all, True)):
+            if nt not in nl:
+                continue
+            # 标题应当“独占一行”：行比标题长太多，多半是正文里顺带提到的
+            if len(nl) - len(nt) > 20:
+                continue
+            score = 40
+            if nl == nt:
+                score = 100
+            elif nl.endswith(nt):
+                score = 85            # 行首有自动编号（1.1 / 第一章 / 一、）
+            elif nl.startswith(nt):
+                score = 70
+            if ln.size >= median_size * 1.08:
+                score += 10
+            if ln.bold:
+                score += 5
+            if first_page is None:
+                first_page = ln.page
+            cands.append((score, i, ln, joined))
+            break
+    cands.sort(key=lambda c: (-c[0], c[1]))
+    return cands
 
 
 def match_headings(headings, lines, toc_pages):
@@ -227,52 +274,30 @@ def match_headings(headings, lines, toc_pages):
             matches.append(m)
             continue
 
-        first_page = None
-        cands = []                  # [(score, index, line)]
-        for i in range(cursor, len(lines)):
-            ln = lines[i]
-            if ln.page in toc_pages:
-                continue
-            if first_page is not None and ln.page > first_page + LOOKAHEAD_PAGES:
-                break
+        # 第一遍：跳过目录页/封面页，在正文里找
+        cands = _scan(lines, nt, cursor, False, toc_pages, median_size)
+        from_toc = False
+        if not cands:
+            # 第二遍：允许命中目录/封面页（例如书名标题只出现在封面），但不推进游标
+            cands = _scan(lines, nt, 0, True, toc_pages, median_size)
+            from_toc = True
 
-            for nl, joined in ((ln.n, False), (ln.n_all, True)):
-                use = ln
-                if nt not in nl:
-                    continue
-                # 标题应当“独占一行”：行比标题长太多，多半是正文里顺带提到的
-                if len(nl) - len(nt) > 20:
-                    continue
-                score = 40
-                if nl == nt:
-                    score = 100
-                elif nl.endswith(nt):
-                    score = 85        # 行首有自动编号（1.1 / 第三章 / 一、）
-                elif nl.startswith(nt):
-                    score = 70
-                if use.size >= median_size * 1.08:
-                    score += 10
-                if use.bold:
-                    score += 5
-                if first_page is None:
-                    first_page = use.page
-                cands.append((score, i, use, joined))
-                break
-
-        if cands:
-            cands.sort(key=lambda c: (-c[0], c[1]))
+        if not cands:
+            m.page = matches[-1].page if matches else 1
+            m.note = "未找到，已沿用上一页"
+        else:
             score, i, ln, joined = cands[0]
             m.page = ln.page
             m.line = ln.full if joined else ln.text
             m.score = score
-            cursor = i
-            if score < 60:
-                m.note = "低位匹配（可能误配，请核对）"
-            elif len(cands) > 1 and cands[1][0] == score and cands[1][2].page != ln.page:
-                m.note = "同名候选跨页，已取靠前者"
-        else:
-            m.page = matches[-1].page if matches else 1
-            m.note = "未找到，已沿用上一页"
+            if from_toc:
+                m.note = "仅见于目录/封面页，已按该页登记"
+            else:
+                cursor = i
+                if score < 60:
+                    m.note = "低位匹配（可能误配，请核对）"
+                elif len(cands) > 1 and cands[1][0] == score and cands[1][2].page != ln.page:
+                    m.note = "同名候选跨页，已取靠前者"
         matches.append(m)
     return matches
 
